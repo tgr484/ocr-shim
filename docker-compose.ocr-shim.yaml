@@ -1,0 +1,25 @@
+  # --- добавьте этот сервис в ваш docker-compose.yaml ---
+  ocr-shim:
+    container_name: ocr-shim
+    build: ./ocr-shim                     # или image: docker.sphere.rn-t.ru/docker-rnd-ai/ocr-shim:1.0 после сборки/пуша
+    restart: unless-stopped
+    networks:
+      - internal
+    volumes:
+      # тот же внутренний CA, что и у librechat — чтобы доверять TLS у llmproxy
+      - ./librechat/RN-T.RU.crt:/app/ca.crt:ro
+    environment:
+      - LLM_CHAT_URL=https://llmproxy.rnd-ai.rn-t.ru/v1/chat/completions
+      - LLM_API_KEY=${LITELLM_API_KEY}
+      - VISION_MODEL=qwen-3.6-thinking      # ВАЖНО: укажите алиас vision-модели в LiteLLM (та, что распознаёт картинки в чате)
+      - SELF_BASE_URL=http://ocr-shim:8000
+      - OCR_SHARED_SECRET=${OCR_API_KEY}    # должен совпадать с ocr.apiKey в librechat.yaml
+      - CA_CERT=/app/ca.crt
+      - OCR_DPI=200
+      - CONCURRENCY=4
+      - OCR_MAX_TOKENS=4096
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
