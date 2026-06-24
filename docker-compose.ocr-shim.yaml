@@ -16,6 +16,14 @@
       - OCR_SHARED_SECRET=${OCR_API_KEY}    # должен совпадать с ocr.apiKey в librechat.yaml
       - CA_CERT=/app/ca.crt
       - OCR_DPI=200
+      - OCR_ENGINE=llm                        # llm по умолчанию; экспериментально: tesseract
+      - ENABLE_TESSERACT_OCR=false            # нужно true для OCR_ENGINE=tesseract и ENABLE_OCR_COMPARISON=true
+      - TESSERACT_LANGS=rus+eng+chi_sim        # русский, английский, китайский упрощенный
+      - TESSERACT_TIMEOUT=120
+      - ENABLE_OCR_COMPARISON=false            # экспериментально: сравнить LLM OCR и Tesseract через LLM-судью
+      - OCR_COMPARISON_MODEL=                  # обязательно при ENABLE_OCR_COMPARISON=true
+      - OCR_COMPARISON_TIMEOUT=120
+      - MAX_OCR_COMPARISON_TEXT_CHARS=20000
       - DOCUMENT_CONCURRENCY=1
       - CONCURRENCY=4
       - OCR_MAX_TOKENS=4096
