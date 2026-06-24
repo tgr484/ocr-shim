@@ -16,6 +16,7 @@
       - OCR_SHARED_SECRET=${OCR_API_KEY}    # должен совпадать с ocr.apiKey в librechat.yaml
       - CA_CERT=/app/ca.crt
       - OCR_DPI=200
+      - DOCUMENT_CONCURRENCY=1
       - CONCURRENCY=4
       - OCR_MAX_TOKENS=4096
     healthcheck:

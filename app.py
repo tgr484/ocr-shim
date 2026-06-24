@@ -20,6 +20,7 @@ import base64
 import asyncio
 import logging
 import tempfile
+import time
 import uuid
 from typing import Optional
 
@@ -39,7 +40,8 @@ SELF_BASE_URL  = os.environ.get("SELF_BASE_URL", "http://ocr-shim:8000")
 SHARED_SECRET  = os.environ.get("OCR_SHARED_SECRET", "")         # optional: must match LibreChat OCR_API_KEY
 CA_CERT        = os.environ.get("CA_CERT", "")                   # path to internal CA bundle for LiteLLM TLS
 OCR_DPI        = int(os.environ.get("OCR_DPI", "200"))
-CONCURRENCY    = int(os.environ.get("CONCURRENCY", "4"))
+CONCURRENCY    = max(1, int(os.environ.get("CONCURRENCY", "4")))
+DOCUMENT_CONCURRENCY = max(1, int(os.environ.get("DOCUMENT_CONCURRENCY", "1")))
 MAX_TOKENS     = int(os.environ.get("OCR_MAX_TOKENS", "4096"))
 HTTP_TIMEOUT   = float(os.environ.get("LLM_TIMEOUT", "180"))
 
@@ -55,6 +57,7 @@ STORE = tempfile.gettempdir()
 _verify = CA_CERT if CA_CERT and os.path.exists(CA_CERT) else True
 
 app = FastAPI(title="LibreChat OCR shim", version="1.0")
+DOCUMENT_SEM = asyncio.Semaphore(DOCUMENT_CONCURRENCY)
 
 
 def _check_auth(authorization: Optional[str]):
@@ -146,7 +149,15 @@ def _rasterize(file_id: str) -> list[bytes]:
     return [open(p, "rb").read()]
 
 
-async def _ocr_page(client: httpx.AsyncClient, png: bytes, sem: asyncio.Semaphore) -> str:
+async def _ocr_page(
+    client: httpx.AsyncClient,
+    png: bytes,
+    sem: asyncio.Semaphore,
+    page_index: int,
+    total_pages: int,
+    progress: dict[str, int],
+    progress_lock: asyncio.Lock,
+) -> str:
     b64 = base64.b64encode(png).decode()
     payload = {
         "model": VISION_MODEL,
@@ -166,7 +177,20 @@ async def _ocr_page(client: httpx.AsyncClient, png: bytes, sem: asyncio.Semaphor
     if LLM_API_KEY:
         headers["Authorization"] = f"Bearer {LLM_API_KEY}"
     async with sem:
+        start = time.perf_counter()
+        log.info("OCR page %d/%d: started", page_index + 1, total_pages)
         r = await client.post(LLM_CHAT_URL, json=payload, headers=headers, timeout=HTTP_TIMEOUT)
+        log.info(
+            "OCR page %d/%d: completed in %.1fs",
+            page_index + 1,
+            total_pages,
+            time.perf_counter() - start,
+        )
+        async with progress_lock:
+            progress["completed"] += 1
+            completed = progress["completed"]
+            percent = completed * 100 / total_pages
+        log.info("OCR progress: %d/%d pages completed (%.1f%%)", completed, total_pages, percent)
     r.raise_for_status()
     data = r.json()
     try:
@@ -186,12 +210,41 @@ async def ocr(request: Request, authorization: Optional[str] = Header(None)):
     if not os.path.exists(_path(file_id)):
         raise HTTPException(status_code=404, detail="file not found")
 
-    images = _rasterize(file_id)
-    log.info("OCR file %s: %d page(s) via %s", file_id, len(images), VISION_MODEL)
+    if DOCUMENT_SEM.locked():
+        log.info(
+            "OCR file %s: waiting for document slot, document_concurrency=%d",
+            file_id,
+            DOCUMENT_CONCURRENCY,
+        )
+    async with DOCUMENT_SEM:
+        document_start = time.perf_counter()
+        images = _rasterize(file_id)
+        log.info(
+            "OCR file %s: %d page(s) via %s, document_concurrency=%d, page_concurrency=%d",
+            file_id,
+            len(images),
+            VISION_MODEL,
+            DOCUMENT_CONCURRENCY,
+            CONCURRENCY,
+        )
 
-    sem = asyncio.Semaphore(CONCURRENCY)
-    async with httpx.AsyncClient(verify=_verify) as client:
-        texts = await asyncio.gather(*[_ocr_page(client, img, sem) for img in images])
+        sem = asyncio.Semaphore(CONCURRENCY)
+        progress = {"completed": 0}
+        progress_lock = asyncio.Lock()
+        limits = httpx.Limits(max_connections=CONCURRENCY, max_keepalive_connections=CONCURRENCY)
+        async with httpx.AsyncClient(verify=_verify, limits=limits) as client:
+            texts = await asyncio.gather(
+                *[
+                    _ocr_page(client, img, sem, page_index, len(images), progress, progress_lock)
+                    for page_index, img in enumerate(images)
+                ]
+            )
+        log.info(
+            "OCR file %s: completed %d page(s) in %.1fs",
+            file_id,
+            len(images),
+            time.perf_counter() - document_start,
+        )
 
     pages = [{"index": i, "markdown": t, "images": [], "dimensions": None} for i, t in enumerate(texts)]
     return JSONResponse({"pages": pages, "model": VISION_MODEL, "usage_info": {"pages_processed": len(pages)}})
