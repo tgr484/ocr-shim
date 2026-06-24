@@ -19,9 +19,13 @@ import io
 import base64
 import asyncio
 import logging
+import shutil
+import subprocess
 import tempfile
 import time
 import uuid
+import zipfile
+import xml.etree.ElementTree as ET
 from typing import Optional
 
 import fitz  # PyMuPDF
@@ -44,6 +48,13 @@ CONCURRENCY    = max(1, int(os.environ.get("CONCURRENCY", "4")))
 DOCUMENT_CONCURRENCY = max(1, int(os.environ.get("DOCUMENT_CONCURRENCY", "1")))
 MAX_TOKENS     = int(os.environ.get("OCR_MAX_TOKENS", "4096"))
 HTTP_TIMEOUT   = float(os.environ.get("LLM_TIMEOUT", "180"))
+ENABLE_OFFICE_OCR = os.environ.get("ENABLE_OFFICE_OCR", "").lower() in {"1", "true", "yes", "on"}
+OFFICE_CONVERT_TIMEOUT = int(os.environ.get("OFFICE_CONVERT_TIMEOUT", "120"))
+OFFICE_OCR_TEXT_THRESHOLD = int(os.environ.get("OFFICE_OCR_TEXT_THRESHOLD", "50"))
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(60 * 1024 * 1024)))
+MAX_RENDERED_PAGES = int(os.environ.get("MAX_RENDERED_PAGES", "80"))
+MAX_OCR_PAGES = int(os.environ.get("MAX_OCR_PAGES", "60"))
+MAX_EXTRACTED_TEXT_CHARS = int(os.environ.get("MAX_EXTRACTED_TEXT_CHARS", "300000"))
 
 OCR_PROMPT = os.environ.get(
     "OCR_PROMPT",
@@ -84,6 +95,18 @@ async def upload_file(
     _check_auth(authorization)
     file_id = uuid.uuid4().hex
     data = await file.read()
+    if len(data) > MAX_UPLOAD_BYTES:
+        log.warning(
+            "rejecting upload %s (%s): %d bytes exceeds limit %d",
+            file.filename,
+            file.content_type,
+            len(data),
+            MAX_UPLOAD_BYTES,
+        )
+        raise HTTPException(
+            status_code=413,
+            detail=f"file is too large: {len(data)} bytes, limit is {MAX_UPLOAD_BYTES} bytes",
+        )
     with open(_path(file_id), "wb") as f:
         f.write(data)
     # also remember original filename/mime for type detection
@@ -119,13 +142,18 @@ def _extract_id(url: str) -> str:
     return m.group(1)
 
 
-def _is_pdf(file_id: str) -> bool:
+def _metadata(file_id: str) -> tuple[str, str]:
     meta = _path(file_id) + ".meta"
     name = ctype = ""
     if os.path.exists(meta):
         parts = open(meta).read().split("\n")
         name = parts[0] if parts else ""
         ctype = parts[1] if len(parts) > 1 else ""
+    return name, ctype
+
+
+def _is_pdf(file_id: str) -> bool:
+    name, ctype = _metadata(file_id)
     if "pdf" in ctype.lower() or name.lower().endswith(".pdf"):
         return True
     # sniff magic bytes
@@ -133,20 +161,308 @@ def _is_pdf(file_id: str) -> bool:
         return f.read(5) == b"%PDF-"
 
 
+def _is_office_document(file_id: str) -> bool:
+    name, ctype = _metadata(file_id)
+    lower_name = name.lower()
+    lower_ctype = ctype.lower()
+    office_exts = (".doc", ".docx", ".ppt", ".pptx", ".odt", ".ott", ".odp", ".otp")
+    office_mimes = (
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.ms-powerpoint",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/vnd.oasis.opendocument.text",
+        "application/vnd.oasis.opendocument.text-template",
+        "application/vnd.oasis.opendocument.presentation",
+        "application/vnd.oasis.opendocument.presentation-template",
+    )
+    return lower_name.endswith(office_exts) or lower_ctype in office_mimes
+
+
+def _office_suffix(file_id: str) -> str:
+    name, _ = _metadata(file_id)
+    lower_name = name.lower()
+    for suffix in (".docx", ".doc", ".pptx", ".ppt", ".odt", ".ott", ".odp", ".otp"):
+        if lower_name.endswith(suffix):
+            return suffix
+    return ".bin"
+
+
+def _plain_text_length(text: str) -> int:
+    return len(re.sub(r"\s+", "", text))
+
+
+def _normalize_line(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _text_from_node(node: ET.Element) -> str:
+    chunks = []
+    for child in node.iter():
+        if child.text:
+            chunks.append(child.text)
+    return _normalize_line(" ".join(chunks))
+
+
+def _numeric_suffix(name: str) -> int:
+    m = re.search(r"(\d+)\.xml$", name)
+    return int(m.group(1)) if m else 0
+
+
+def _limit_extracted_text(file_id: str, text: str) -> str:
+    if len(text) <= MAX_EXTRACTED_TEXT_CHARS:
+        return text
+    log.warning(
+        "Office file %s: truncating extracted text from %d to %d chars",
+        file_id,
+        len(text),
+        MAX_EXTRACTED_TEXT_CHARS,
+    )
+    marker = "\n\n[Text truncated by OCR shim: MAX_EXTRACTED_TEXT_CHARS reached.]"
+    return text[:MAX_EXTRACTED_TEXT_CHARS].rstrip() + marker
+
+
+def _extract_ooxml_text(path: str, prefixes: tuple[str, ...]) -> str:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            xml_names = [
+                name
+                for name in archive.namelist()
+                if name.endswith(".xml") and any(name.startswith(prefix) for prefix in prefixes)
+            ]
+            chunks = []
+            for name in xml_names:
+                try:
+                    root = ET.fromstring(archive.read(name))
+                except ET.ParseError:
+                    continue
+                for node in root.iter():
+                    if node.tag.endswith("}p"):
+                        line = _text_from_node(node)
+                        if line:
+                            chunks.append(line)
+            return "\n\n".join(chunks)
+    except zipfile.BadZipFile:
+        return ""
+
+
+def _extract_docx_text(path: str) -> str:
+    return _extract_ooxml_text(path, ("word/",))
+
+
+def _extract_pptx_text(path: str) -> str:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            slide_names = sorted(
+                [
+                    name
+                    for name in archive.namelist()
+                    if re.match(r"ppt/slides/slide\d+\.xml$", name)
+                ],
+                key=_numeric_suffix,
+            )
+            notes_names = sorted(
+                [
+                    name
+                    for name in archive.namelist()
+                    if re.match(r"ppt/notesSlides/notesSlide\d+\.xml$", name)
+                ],
+                key=_numeric_suffix,
+            )
+            sections = []
+            for idx, name in enumerate(slide_names, start=1):
+                try:
+                    root = ET.fromstring(archive.read(name))
+                except ET.ParseError:
+                    continue
+                lines = []
+                for node in root.iter():
+                    if node.tag.endswith("}p"):
+                        line = _text_from_node(node)
+                        if line:
+                            lines.append(line)
+                if lines:
+                    sections.append(f"# Slide {idx}\n\n" + "\n".join(lines))
+            for idx, name in enumerate(notes_names, start=1):
+                try:
+                    root = ET.fromstring(archive.read(name))
+                except ET.ParseError:
+                    continue
+                lines = []
+                for node in root.iter():
+                    if node.tag.endswith("}p"):
+                        line = _text_from_node(node)
+                        if line:
+                            lines.append(line)
+                if lines:
+                    sections.append(f"# Notes {idx}\n\n" + "\n".join(lines))
+            return "\n\n".join(sections)
+    except zipfile.BadZipFile:
+        return ""
+
+
+def _extract_odf_text(path: str) -> str:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            xml_names = [name for name in ("content.xml", "styles.xml") if name in archive.namelist()]
+            sections = []
+            for name in xml_names:
+                try:
+                    root = ET.fromstring(archive.read(name))
+                except ET.ParseError:
+                    continue
+                chunks = []
+                for node in root.iter():
+                    if node.tag.endswith("}h") or node.tag.endswith("}p"):
+                        line = _text_from_node(node)
+                        if line:
+                            chunks.append(line)
+                if chunks:
+                    sections.append(f"# {name}\n\n" + "\n\n".join(chunks))
+            return "\n\n".join(sections)
+    except zipfile.BadZipFile:
+        return ""
+
+
+def _extract_office_text(file_id: str) -> str:
+    suffix = _office_suffix(file_id)
+    path = _path(file_id)
+    if suffix == ".docx":
+        return _limit_extracted_text(file_id, _extract_docx_text(path))
+    if suffix == ".pptx":
+        return _limit_extracted_text(file_id, _extract_pptx_text(path))
+    if suffix in {".odt", ".ott", ".odp", ".otp"}:
+        return _limit_extracted_text(file_id, _extract_odf_text(path))
+    return ""
+
+
+def _extract_text_heavy_office(file_id: str) -> Optional[str]:
+    text = _extract_office_text(file_id)
+    text_length = _plain_text_length(text)
+    if text_length >= OFFICE_OCR_TEXT_THRESHOLD:
+        log.info(
+            "Office file %s: found %d text chars, returning %d chars without OCR",
+            file_id,
+            text_length,
+            len(text),
+        )
+        return text
+    log.info(
+        "Office file %s: found %d text chars, using Office OCR",
+        file_id,
+        text_length,
+    )
+    return None
+
+
+def _convert_office_to_pdf(file_id: str) -> str:
+    if not ENABLE_OFFICE_OCR:
+        raise HTTPException(
+            status_code=415,
+            detail="office document OCR is disabled; set ENABLE_OFFICE_OCR=true to enable it",
+        )
+    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    if not soffice:
+        raise HTTPException(
+            status_code=500,
+            detail="office document OCR requires LibreOffice/soffice in the runtime image",
+        )
+
+    source = _path(file_id)
+    with tempfile.TemporaryDirectory(prefix="ocrshim-office-") as workdir:
+        suffix = _office_suffix(file_id)
+        input_path = os.path.join(workdir, f"input{suffix}")
+        profile_path = os.path.join(workdir, "lo-profile")
+        profile_uri = "file://" + os.path.abspath(profile_path)
+        shutil.copyfile(source, input_path)
+        cmd = [
+            soffice,
+            "--headless",
+            "--nologo",
+            "--nofirststartwizard",
+            f"-env:UserInstallation={profile_uri}",
+            "--convert-to",
+            "pdf",
+            "--outdir",
+            workdir,
+            input_path,
+        ]
+        try:
+            start = time.perf_counter()
+            log.info("Office file %s: LibreOffice conversion started, suffix=%s", file_id, suffix)
+            completed = subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=OFFICE_CONVERT_TIMEOUT,
+            )
+            log.info(
+                "Office file %s: LibreOffice conversion completed in %.1fs",
+                file_id,
+                time.perf_counter() - start,
+            )
+        except subprocess.TimeoutExpired:
+            log.warning(
+                "Office file %s: LibreOffice conversion timed out after %ds",
+                file_id,
+                OFFICE_CONVERT_TIMEOUT,
+            )
+            raise HTTPException(status_code=504, detail="office document conversion timed out")
+        except subprocess.CalledProcessError as exc:
+            log.warning("office conversion failed: stdout=%s stderr=%s", exc.stdout, exc.stderr)
+            raise HTTPException(status_code=422, detail="office document conversion failed")
+
+        output_path = os.path.join(workdir, "input.pdf")
+        if not os.path.exists(output_path):
+            log.warning(
+                "office conversion did not produce input.pdf: stdout=%s stderr=%s",
+                completed.stdout,
+                completed.stderr,
+            )
+            raise HTTPException(status_code=422, detail="office document conversion produced no PDF")
+
+        converted_path = _path(file_id) + ".office.pdf"
+        shutil.copyfile(output_path, converted_path)
+        return converted_path
+
+
 def _rasterize(file_id: str) -> list[bytes]:
     """Return a list of PNG bytes, one per page (or the single image as-is)."""
     p = _path(file_id)
     if _is_pdf(file_id):
-        pages = []
-        zoom = OCR_DPI / 72.0
-        mat = fitz.Matrix(zoom, zoom)
-        with fitz.open(p) as doc:
-            for page in doc:
-                pix = page.get_pixmap(matrix=mat, alpha=False)
-                pages.append(pix.tobytes("png"))
-        return pages
+        log.info("OCR file %s: rasterize route=pdf", file_id)
+        return _rasterize_pdf(p)
+    if _is_office_document(file_id):
+        log.info("OCR file %s: rasterize route=office", file_id)
+        return _rasterize_pdf(_convert_office_to_pdf(file_id))
     # already an image
+    log.info("OCR file %s: rasterize route=image", file_id)
     return [open(p, "rb").read()]
+
+
+def _rasterize_pdf(path: str) -> list[bytes]:
+    start = time.perf_counter()
+    pages = []
+    zoom = OCR_DPI / 72.0
+    mat = fitz.Matrix(zoom, zoom)
+    with fitz.open(path) as doc:
+        log.info("Rasterize PDF: page_count=%d, dpi=%d", doc.page_count, OCR_DPI)
+        if doc.page_count > MAX_RENDERED_PAGES:
+            log.warning(
+                "Rejecting rasterize: %d pages exceeds rendered page limit %d",
+                doc.page_count,
+                MAX_RENDERED_PAGES,
+            )
+            raise HTTPException(
+                status_code=413,
+                detail=f"document has too many pages: {doc.page_count}, limit is {MAX_RENDERED_PAGES}",
+            )
+        for page in doc:
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            pages.append(pix.tobytes("png"))
+    log.info("Rasterize PDF: rendered %d page(s) in %.1fs", len(pages), time.perf_counter() - start)
+    return pages
 
 
 async def _ocr_page(
@@ -180,6 +496,14 @@ async def _ocr_page(
         start = time.perf_counter()
         log.info("OCR page %d/%d: started", page_index + 1, total_pages)
         r = await client.post(LLM_CHAT_URL, json=payload, headers=headers, timeout=HTTP_TIMEOUT)
+        if r.is_error:
+            log.warning(
+                "OCR page %d/%d: LLM returned HTTP %d: %s",
+                page_index + 1,
+                total_pages,
+                r.status_code,
+                r.text[:1000],
+            )
         log.info(
             "OCR page %d/%d: completed in %.1fs",
             page_index + 1,
@@ -200,6 +524,11 @@ async def _ocr_page(
         return ""
 
 
+def _ocr_response(texts: list[str], model: str) -> JSONResponse:
+    pages = [{"index": i, "markdown": t, "images": [], "dimensions": None} for i, t in enumerate(texts)]
+    return JSONResponse({"pages": pages, "model": model, "usage_info": {"pages_processed": len(pages)}})
+
+
 @app.post("/ocr")
 async def ocr(request: Request, authorization: Optional[str] = Header(None)):
     _check_auth(authorization)
@@ -218,7 +547,28 @@ async def ocr(request: Request, authorization: Optional[str] = Header(None)):
         )
     async with DOCUMENT_SEM:
         document_start = time.perf_counter()
-        images = _rasterize(file_id)
+        if _is_office_document(file_id):
+            extracted_text = _extract_text_heavy_office(file_id)
+            if extracted_text is not None:
+                log.info(
+                    "OCR file %s: returned Office extracted text in %.1fs",
+                    file_id,
+                    time.perf_counter() - document_start,
+                )
+                return _ocr_response([extracted_text], "office_text_parser")
+
+        images = await asyncio.to_thread(_rasterize, file_id)
+        if len(images) > MAX_OCR_PAGES:
+            log.warning(
+                "OCR file %s: rejecting %d OCR pages, limit is %d",
+                file_id,
+                len(images),
+                MAX_OCR_PAGES,
+            )
+            raise HTTPException(
+                status_code=413,
+                detail=f"document has too many OCR pages: {len(images)}, limit is {MAX_OCR_PAGES}",
+            )
         log.info(
             "OCR file %s: %d page(s) via %s, document_concurrency=%d, page_concurrency=%d",
             file_id,
@@ -246,15 +596,14 @@ async def ocr(request: Request, authorization: Optional[str] = Header(None)):
             time.perf_counter() - document_start,
         )
 
-    pages = [{"index": i, "markdown": t, "images": [], "dimensions": None} for i, t in enumerate(texts)]
-    return JSONResponse({"pages": pages, "model": VISION_MODEL, "usage_info": {"pages_processed": len(pages)}})
+    return _ocr_response(texts, VISION_MODEL)
 
 
 # --- 4) cleanup -------------------------------------------------------------
 @app.delete("/files/{file_id}")
 async def delete_file(file_id: str, authorization: Optional[str] = Header(None)):
     _check_auth(authorization)
-    for suffix in ("", ".meta"):
+    for suffix in ("", ".meta", ".office.pdf"):
         try:
             os.remove(_path(file_id) + suffix)
         except FileNotFoundError:

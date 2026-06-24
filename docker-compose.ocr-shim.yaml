@@ -19,6 +19,13 @@
       - DOCUMENT_CONCURRENCY=1
       - CONCURRENCY=4
       - OCR_MAX_TOKENS=4096
+      - MAX_UPLOAD_BYTES=62914560            # 60 MB
+      - MAX_RENDERED_PAGES=80
+      - MAX_OCR_PAGES=60
+      - MAX_EXTRACTED_TEXT_CHARS=300000
+      - ENABLE_OFFICE_OCR=false              # экспериментально: OCR .doc/.docx/.ppt/.pptx/.odt/.ott/.odp/.otp через LibreOffice -> PDF
+      - OFFICE_CONVERT_TIMEOUT=120
+      - OFFICE_OCR_TEXT_THRESHOLD=50          # если найдено >= 50 символов текста, OCR пропускается для fallback parser
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
       interval: 60s
