@@ -31,6 +31,9 @@
       - MAX_RENDERED_PAGES=80
       - MAX_OCR_PAGES=60
       - MAX_EXTRACTED_TEXT_CHARS=300000
+      - MDDOC_URL=http://mddoc:8000          # DOCX/PPTX -> MDdoc (Markdown); пусто — локальный разбор
+      - MDDOC_API_KEY=${MDDOC_API_KEY_OCRSHIM}
+      - MDDOC_TIMEOUT=120
       - ENABLE_OFFICE_OCR=false              # экспериментально: OCR .doc/.docx/.ppt/.pptx/.odt/.ott/.odp/.otp через LibreOffice -> PDF
       - OFFICE_CONVERT_TIMEOUT=120
       - OFFICE_OCR_TEXT_THRESHOLD=50          # если найдено >= 50 символов текста, OCR пропускается для fallback parser

@@ -65,6 +65,13 @@ MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(60 * 1024 * 1024))
 MAX_RENDERED_PAGES = int(os.environ.get("MAX_RENDERED_PAGES", "80"))
 MAX_OCR_PAGES = int(os.environ.get("MAX_OCR_PAGES", "60"))
 MAX_EXTRACTED_TEXT_CHARS = int(os.environ.get("MAX_EXTRACTED_TEXT_CHARS", "300000"))
+# DOCX/PPTX go to MDdoc first: it parses the markup (headings, tables, lists) and
+# describes figures. Unset MDDOC_URL or MDDOC_API_KEY to keep the local parser.
+MDDOC_URL = os.environ.get("MDDOC_URL", "").rstrip("/")            # e.g. http://mddoc:8000
+MDDOC_API_KEY = os.environ.get("MDDOC_API_KEY", "")                # key of the MDdoc source for ocr-shim
+MDDOC_TIMEOUT = float(os.environ.get("MDDOC_TIMEOUT", "120"))       # whole job: upload, queue, parse
+MDDOC_POLL_INTERVAL = float(os.environ.get("MDDOC_POLL_INTERVAL", "1"))
+MDDOC_SUFFIXES = (".docx", ".pptx")
 
 OCR_PROMPT = os.environ.get(
     "OCR_PROMPT",
@@ -230,12 +237,30 @@ def _normalize_line(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+_ODF_NAMESPACE = "{urn:oasis:names:tc:opendocument"
+
+
 def _text_from_node(node: ET.Element) -> str:
+    """Visible text of one paragraph.
+
+    Word and PowerPoint split a word into runs wherever formatting, spell-check
+    or revision marks change, so runs are joined without a separator. Only
+    `t` elements carry text: deleted revisions (`w:delText`) and field codes
+    (`w:instrText`, e.g. `PAGE \\* MERGEFORMAT`) are not part of the document.
+    ODF keeps text as mixed content, so its spans are read with their tails.
+    """
+    if node.tag.startswith(_ODF_NAMESPACE):
+        return _normalize_line("".join(node.itertext()))
     chunks = []
     for child in node.iter():
-        if child.text:
+        local = child.tag.rsplit("}", 1)[-1]
+        if local == "t" and child.text:
             chunks.append(child.text)
-    return _normalize_line(" ".join(chunks))
+        elif local == "tab":
+            chunks.append("\t")
+        elif local in ("br", "cr"):
+            chunks.append("\n")
+    return _normalize_line("".join(chunks))
 
 
 def _numeric_suffix(name: str) -> int:
@@ -368,6 +393,83 @@ def _extract_office_text(file_id: str) -> str:
     if suffix in {".odt", ".ott", ".odp", ".otp"}:
         return _limit_extracted_text(file_id, _extract_odf_text(path))
     return ""
+
+
+_FIGURE_LINK = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_PAGE_MARKER = re.compile(r"<!--\s*page:\s*(\d+)\s*-->")
+_PAGE_LABELS = {"slide": "Слайд", "sheet": "Лист"}
+
+
+def _clean_mddoc_markdown(markdown: str, page_unit: Optional[str]) -> str:
+    """MDdoc Markdown for a chat model: figure links point to a host the model
+    cannot open (the description follows them as a quote), and a DOCX «page» is
+    a logical section, so its markers are dropped; slides and sheets keep a label."""
+    text = _FIGURE_LINK.sub("[Иллюстрация]", markdown)
+    label = _PAGE_LABELS.get(page_unit or "")
+    text = _PAGE_MARKER.sub(lambda m: f"[{label} {m.group(1)}]" if label else "", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+async def _mddoc_markdown(file_id: str) -> Optional[str]:
+    """Markdown of a DOCX/PPTX from MDdoc, or None to fall back to the local parser:
+    MDdoc not configured, a format it does not take, a failure or a timeout."""
+    suffix = _office_suffix(file_id)
+    if not (MDDOC_URL and MDDOC_API_KEY) or suffix not in MDDOC_SUFFIXES:
+        return None
+    name, ctype = _metadata(file_id)
+    start = time.perf_counter()
+    deadline = time.monotonic() + MDDOC_TIMEOUT
+    try:
+        async with httpx.AsyncClient(
+            base_url=MDDOC_URL,
+            headers={"Authorization": f"Bearer {MDDOC_API_KEY}"},
+            timeout=httpx.Timeout(30.0),
+        ) as client:
+            with open(_path(file_id), "rb") as f:
+                response = await client.post(
+                    "/api/v1/jobs",
+                    files={"file": (name or f"document{suffix}", f, ctype or "application/octet-stream")},
+                )
+            response.raise_for_status()
+            job = response.json()
+            while job["status"] not in ("done", "failed"):
+                if time.monotonic() >= deadline:
+                    log.warning(
+                        "MDdoc file %s: job %s still %s after %.0fs, using local parser",
+                        file_id,
+                        job["job_id"],
+                        job["status"],
+                        MDDOC_TIMEOUT,
+                    )
+                    return None
+                await asyncio.sleep(MDDOC_POLL_INTERVAL)
+                response = await client.get(f"/api/v1/jobs/{job['job_id']}")
+                response.raise_for_status()
+                job = response.json()
+            if job["status"] == "failed":
+                log.warning(
+                    "MDdoc file %s: job %s failed (%s), using local parser",
+                    file_id,
+                    job["job_id"],
+                    job.get("error"),
+                )
+                return None
+            response = await client.get(f"/api/v1/jobs/{job['job_id']}/markdown")
+            response.raise_for_status()
+            markdown = response.text
+    except (httpx.HTTPError, OSError, ValueError, KeyError) as exc:
+        log.warning("MDdoc file %s: %s, using local parser", file_id, exc)
+        return None
+
+    text = _limit_extracted_text(file_id, _clean_mddoc_markdown(markdown, job.get("page_unit")))
+    log.info(
+        "MDdoc file %s: job %s, %d chars in %.1fs",
+        file_id,
+        job["job_id"],
+        len(text),
+        time.perf_counter() - start,
+    )
+    return text if _plain_text_length(text) > 0 else None
 
 
 def _extract_text_heavy_office(file_id: str) -> Optional[str]:
@@ -789,6 +891,13 @@ async def ocr(request: Request, authorization: Optional[str] = Header(None)):
     file_id = _extract_id(url)
     if not os.path.exists(_path(file_id)):
         raise HTTPException(status_code=404, detail="file not found")
+
+    # Before the document slot: MDdoc has its own queue, and waiting on it must
+    # not hold back PDFs that this service recognizes itself.
+    if _is_office_document(file_id):
+        markdown = await _mddoc_markdown(file_id)
+        if markdown is not None:
+            return _ocr_response([markdown], "mddoc")
 
     if DOCUMENT_SEM.locked():
         log.info(
