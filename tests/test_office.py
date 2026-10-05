@@ -96,6 +96,7 @@ def test_office_document_goes_through_mddoc(docx_file, monkeypatch):
         calls.append(f"{request.method} {request.url.path}")
         assert request.headers["authorization"] == "Bearer secret"
         if request.method == "POST":
+            assert b'name="engine"\r\n\r\ntext_only' in request.read()
             return httpx.Response(202, json={"job_id": 7, "status": "queued", "page_unit": None})
         if request.url.path == "/api/v1/jobs/7":
             return httpx.Response(200, json={"job_id": 7, "status": "done", "page_unit": "section"})

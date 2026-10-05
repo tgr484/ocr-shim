@@ -65,12 +65,15 @@ MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(60 * 1024 * 1024))
 MAX_RENDERED_PAGES = int(os.environ.get("MAX_RENDERED_PAGES", "80"))
 MAX_OCR_PAGES = int(os.environ.get("MAX_OCR_PAGES", "60"))
 MAX_EXTRACTED_TEXT_CHARS = int(os.environ.get("MAX_EXTRACTED_TEXT_CHARS", "300000"))
-# DOCX/PPTX go to MDdoc first: it parses the markup (headings, tables, lists) and
-# describes figures. Unset MDDOC_URL or MDDOC_API_KEY to keep the local parser.
+# DOCX/PPTX go to MDdoc first: it parses the markup (headings, tables, lists).
+# Unset MDDOC_URL or MDDOC_API_KEY to keep the local parser.
 MDDOC_URL = os.environ.get("MDDOC_URL", "").rstrip("/")            # e.g. http://mddoc:8000
 MDDOC_API_KEY = os.environ.get("MDDOC_API_KEY", "")                # key of the MDdoc source for ocr-shim
 MDDOC_TIMEOUT = float(os.environ.get("MDDOC_TIMEOUT", "120"))       # whole job: upload, queue, parse
 MDDOC_POLL_INTERVAL = float(os.environ.get("MDDOC_POLL_INTERVAL", "1"))
+# text_only: structure from the markup, no model calls — figures are not described.
+# `chat` makes MDdoc describe every figure with its vision model (slower).
+MDDOC_ENGINE = os.environ.get("MDDOC_ENGINE", "text_only")
 MDDOC_SUFFIXES = (".docx", ".pptx")
 
 OCR_PROMPT = os.environ.get(
@@ -429,6 +432,7 @@ async def _mddoc_markdown(file_id: str) -> Optional[str]:
                 response = await client.post(
                     "/api/v1/jobs",
                     files={"file": (name or f"document{suffix}", f, ctype or "application/octet-stream")},
+                    data={"engine": MDDOC_ENGINE},
                 )
             response.raise_for_status()
             job = response.json()
