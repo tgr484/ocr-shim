@@ -1,44 +1,28 @@
-  # --- добавьте этот сервис в ваш docker-compose.yaml ---
+# Добавьте этот блок в services существующего docker-compose.yaml.
   ocr-shim:
     container_name: ocr-shim
-    build: ./ocr-shim                     # или image: docker.sphere.rn-t.ru/docker-rnd-ai/ocr-shim:1.0 после сборки/пуша
+    image: tgr484/ocr-shim:2.0.0
+    build: ./ocr-shim
     restart: unless-stopped
     networks:
       - internal
-    volumes:
-      # тот же внутренний CA, что и у librechat — чтобы доверять TLS у llmproxy
-      - ./librechat/RN-T.RU.crt:/app/ca.crt:ro
     environment:
-      - LLM_CHAT_URL=https://llmproxy.rnd-ai.rn-t.ru/v1/chat/completions
-      - LLM_API_KEY=${LITELLM_API_KEY}
-      - VISION_MODEL=qwen-3.6-thinking      # ВАЖНО: укажите алиас vision-модели в LiteLLM (та, что распознаёт картинки в чате)
-      - SELF_BASE_URL=http://ocr-shim:8000
-      - OCR_SHARED_SECRET=${OCR_API_KEY}    # должен совпадать с ocr.apiKey в librechat.yaml
-      - CA_CERT=/app/ca.crt
-      - OCR_DPI=200
-      - OCR_ENGINE=llm                        # llm по умолчанию; экспериментально: tesseract
-      - ENABLE_TESSERACT_OCR=false            # нужно true для OCR_ENGINE=tesseract и ENABLE_OCR_COMPARISON=true
-      - TESSERACT_LANGS=rus+eng+chi_sim        # русский, английский, китайский упрощенный
-      - TESSERACT_TIMEOUT=120
-      - ENABLE_OCR_COMPARISON=false            # экспериментально: сравнить LLM OCR и Tesseract через LLM-судью
-      - OCR_COMPARISON_MODEL=                  # обязательно при ENABLE_OCR_COMPARISON=true
-      - OCR_COMPARISON_TIMEOUT=120
-      - MAX_OCR_COMPARISON_TEXT_CHARS=20000
-      - DOCUMENT_CONCURRENCY=1
-      - CONCURRENCY=4
-      - OCR_MAX_TOKENS=4096
-      - MAX_UPLOAD_BYTES=62914560            # 60 MB
-      - MAX_RENDERED_PAGES=80
-      - MAX_OCR_PAGES=60
-      - MAX_EXTRACTED_TEXT_CHARS=300000
-      - MDDOC_URL=http://mddoc:8000          # DOCX/PPTX -> MDdoc (Markdown); пусто — локальный разбор
-      - MDDOC_API_KEY=${MDDOC_API_KEY_OCRSHIM}
-      - MDDOC_TIMEOUT=120
-      - ENABLE_OFFICE_OCR=false              # экспериментально: OCR .doc/.docx/.ppt/.pptx/.odt/.ott/.odp/.otp через LibreOffice -> PDF
-      - OFFICE_CONVERT_TIMEOUT=120
-      - OFFICE_OCR_TEXT_THRESHOLD=50          # если найдено >= 50 символов текста, OCR пропускается для fallback parser
+      SELF_BASE_URL: http://ocr-shim:8000
+      OCR_SHARED_SECRET: ${OCR_API_KEY}
+      MDDOC_URL: ${MDDOC_URL:-http://mddoc:8000}
+      MDDOC_API_KEY: ${MDDOC_API_KEY_OCRSHIM}
+      MDDOC_ENGINE: ${MDDOC_ENGINE:-}
+      MDDOC_TIMEOUT: ${MDDOC_TIMEOUT:-1800}
+      MDDOC_POLL_INTERVAL: ${MDDOC_POLL_INTERVAL:-5}
+      MDDOC_HTTP_TIMEOUT: ${MDDOC_HTTP_TIMEOUT:-30}
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-62914560}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    # Для HTTPS к MDdoc с внутренним CA раскомментируйте mount и добавьте
+    # CA_CERT: /app/ca.crt в environment.
+    # volumes:
+    #   - ./librechat/RN-T.RU.crt:/app/ca.crt:ro
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
       interval: 60s
       timeout: 10s
       retries: 3
