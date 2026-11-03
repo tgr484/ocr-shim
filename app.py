@@ -13,14 +13,14 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import BinaryIO, Literal
+from typing import Annotated, BinaryIO, Literal
 from urllib.parse import urlsplit
 
 import anyio
 import httpx
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, TypeAdapter
 from starlette.concurrency import run_in_threadpool
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
@@ -32,6 +32,9 @@ CA_CERT = os.environ.get("CA_CERT", "")
 MDDOC_URL = os.environ.get("MDDOC_URL", "").strip().rstrip("/")
 MDDOC_API_KEY = os.environ.get("MDDOC_API_KEY", "").strip()
 MDDOC_ENGINE = os.environ.get("MDDOC_ENGINE", "").strip()
+MDDOC_DESCRIBE_PDF_FIGURES = TypeAdapter(bool).validate_python(
+    os.environ.get("MDDOC_DESCRIBE_PDF_FIGURES", "true")
+)
 MDDOC_TIMEOUT = float(os.environ.get("MDDOC_TIMEOUT", "1800"))
 MDDOC_POLL_INTERVAL = float(os.environ.get("MDDOC_POLL_INTERVAL", "5"))
 MDDOC_HTTP_TIMEOUT = float(os.environ.get("MDDOC_HTTP_TIMEOUT", "30"))
@@ -43,6 +46,7 @@ STORE = tempfile.gettempdir()
 class Job(BaseModel):
     job_id: int = Field(gt=0)
     status: Literal["queued", "parsing", "recognizing", "assembling", "done", "failed"]
+    describe_pdf_figures: bool = True
     page_unit: str | None = None
     page_count: int = Field(default=0, ge=0)
     pages_done: int = Field(default=0, ge=0)
@@ -81,7 +85,7 @@ async def lifespan(app: FastAPI):
         yield
 
 
-app = FastAPI(title="LibreChat MDdoc adapter", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="LibreChat MDdoc adapter", version="2.0.1", lifespan=lifespan)
 
 
 def _check_auth(authorization: str | None):
@@ -188,8 +192,15 @@ async def upload_file(
     file: UploadFile = File(...),
     purpose: str = Form("ocr"),
     authorization: str | None = Header(None),
+    describe_pdf_figures: Annotated[bool | None, Form()] = None,
 ):
     _check_auth(authorization)
+    describe_figures = (
+        MDDOC_DESCRIBE_PDF_FIGURES if describe_pdf_figures is None else describe_pdf_figures
+    )
+    data = {"describe_pdf_figures": str(describe_figures).lower()}
+    if MDDOC_ENGINE:
+        data["engine"] = MDDOC_ENGINE
     if file.size is not None and file.size > MAX_UPLOAD_BYTES:
         raise HTTPException(413, f"file is too large; limit is {MAX_UPLOAD_BYTES} bytes")
     file_id = uuid.uuid4().hex
@@ -203,9 +214,13 @@ async def upload_file(
                 request.app.state.mddoc,
                 "POST", "api/v1/jobs",
                 files={"file": (filename, source, content_type)},
-                data={"engine": MDDOC_ENGINE} if MDDOC_ENGINE else {},
+                data=data,
             )
         job = _decode_job(response)
+        if job.describe_pdf_figures != describe_figures:
+            raise HTTPException(
+                502, "MDdoc did not apply describe_pdf_figures; update MDdoc to support per-document figure modes",
+            )
         record = StoredFile(job_id=job.job_id, filename=filename, content_type=content_type)
         path.with_suffix(".meta").write_text(record.model_dump_json(), encoding="utf-8")
     except BaseException:
