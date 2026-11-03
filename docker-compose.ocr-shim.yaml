@@ -1,7 +1,7 @@
 # Добавьте этот блок в services существующего docker-compose.yaml.
   ocr-shim:
     container_name: ocr-shim
-    image: tgr484/ocr-shim:2.0.0
+    image: tgr484/ocr-shim:2.0.1
     build: ./ocr-shim
     restart: unless-stopped
     networks:
@@ -12,6 +12,7 @@
       MDDOC_URL: ${MDDOC_URL:-http://mddoc:8000}
       MDDOC_API_KEY: ${MDDOC_API_KEY_OCRSHIM}
       MDDOC_ENGINE: ${MDDOC_ENGINE:-}
+      MDDOC_DESCRIBE_PDF_FIGURES: ${MDDOC_DESCRIBE_PDF_FIGURES:-true}
       MDDOC_TIMEOUT: ${MDDOC_TIMEOUT:-1800}
       MDDOC_POLL_INTERVAL: ${MDDOC_POLL_INTERVAL:-5}
       MDDOC_HTTP_TIMEOUT: ${MDDOC_HTTP_TIMEOUT:-30}

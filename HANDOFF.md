@@ -55,3 +55,11 @@ pip install -r requirements-dev.txt
 pytest -q
 docker build -t ocr-shim:local .
 ```
+
+## Режим иллюстраций PDF
+
+OCR-shim передаёт `describe_pdf_figures=true|false` в POST /api/v1/jobs.
+Значение по умолчанию выбирается `MDDOC_DESCRIBE_PDF_FIGURES` в адаптере;
+поле формы POST /files переопределяет его для отдельной загрузки.
+MDdoc хранит флаг в задаче и учитывает в дедупликации. Конфиг MDdoc не
+меняется; требуется поддержка параметра API из MDdoc PR #22.
