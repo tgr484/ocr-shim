@@ -29,6 +29,7 @@ def job(status="done", **kwargs):
         "job_id": 7, "status": status, "page_unit": "pdf_page",
         "page_count": 2, "pages_done": 2, "figures_total": 1, "figures_done": 1,
         "position": None, "retry_rounds": 0, "retry_at": None, "error": None,
+        "describe_pdf_figures": True,
         **kwargs,
     }
 
@@ -66,7 +67,11 @@ class MDdoc:
                 }
                 for part in message.iter_parts()
             })
-            return httpx.Response(self.submit_status, json=self.submit_job)
+            submitted = {
+                **self.submit_job,
+                "describe_pdf_figures": self.uploads[-1]["describe_pdf_figures"]["content"] == b"true",
+            }
+            return httpx.Response(self.submit_status, json=submitted)
         if request.method == "GET" and path == "/api/v1/jobs/7":
             if self.states:
                 self.last_state = self.states.popleft()
@@ -85,6 +90,7 @@ def service(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "MDDOC_URL", "http://mddoc:8000")
     monkeypatch.setattr(app, "MDDOC_API_KEY", "mddoc-secret")
     monkeypatch.setattr(app, "MDDOC_ENGINE", "")
+    monkeypatch.setattr(app, "MDDOC_DESCRIBE_PDF_FIGURES", True)
     monkeypatch.setattr(app, "CA_CERT", "")
     monkeypatch.setattr(app, "MDDOC_POLL_INTERVAL", 0.001)
     monkeypatch.setattr(app, "MDDOC_TIMEOUT", 2)
@@ -152,6 +158,7 @@ def test_all_formats_are_forwarded_without_local_parsing(service, extension):
     file_id = upload(client, filename, "application/octet-stream", b"unparsed\x00original")
     assert fake.uploads == [{
         "file": {"filename": filename, "content_type": "application/octet-stream", "content": b"unparsed\x00original"},
+        "describe_pdf_figures": {"filename": None, "content_type": "text/plain", "content": b"true"},
     }]
     assert recognize(client, file_id).status_code == 200
 
@@ -479,3 +486,86 @@ def test_startup_requires_valid_backend_configuration(monkeypatch, setting, valu
     with pytest.raises(ValueError, match=error):
         with TestClient(app.app):
             pytest.fail("Startup should fail")
+
+
+@pytest.mark.parametrize("default", [True, False])
+def test_default_pdf_figure_mode_is_forwarded(service, monkeypatch, default):
+    client, fake = service
+    monkeypatch.setattr(app, "MDDOC_DESCRIBE_PDF_FIGURES", default)
+    upload(client)
+    assert fake.uploads[-1]["describe_pdf_figures"]["content"] == str(default).lower().encode()
+
+
+@pytest.mark.parametrize("default,requested", [(True, False), (False, True), (True, True), (False, False)])
+def test_upload_pdf_figure_mode_overrides_shim_default(service, monkeypatch, default, requested):
+    client, fake = service
+    monkeypatch.setattr(app, "MDDOC_DESCRIBE_PDF_FIGURES", default)
+    response = client.post(
+        "/files",
+        files={"file": ("modes.pdf", CONTENT, "application/pdf")},
+        data={"describe_pdf_figures": str(requested).lower()},
+    )
+    assert response.status_code == 200, response.text
+    assert fake.uploads[-1]["describe_pdf_figures"]["content"] == str(requested).lower().encode()
+    assert app.MDDOC_DESCRIBE_PDF_FIGURES is default
+
+
+def test_upload_pdf_figure_mode_does_not_leak_to_other_files(service):
+    client, fake = service
+    response = client.post(
+        "/files", files={"file": ("modes.pdf", CONTENT)},
+        data={"describe_pdf_figures": "false"},
+    )
+    assert response.status_code == 200
+    upload(client)
+    assert [
+        uploaded["describe_pdf_figures"]["content"] for uploaded in fake.uploads
+    ] == [b"false", b"true"]
+
+
+def test_ignored_pdf_figure_mode_is_a_clear_error_and_cleans_upload(service):
+    client, fake = service
+    old_backend = job("queued")
+    old_backend.pop("describe_pdf_figures")
+    fake.overrides[("POST", "/api/v1/jobs")] = httpx.Response(202, json=old_backend)
+    response = client.post(
+        "/files", files={"file": ("modes.pdf", CONTENT)},
+        data={"describe_pdf_figures": "false"},
+    )
+    assert response.status_code == 502
+    assert "describe_pdf_figures" in response.json()["detail"]
+    assert not list(app.Path(app.STORE).iterdir())
+
+
+def test_default_pdf_figure_mode_remains_compatible_with_old_mddoc(service):
+    client, fake = service
+    old_backend = job("queued")
+    old_backend.pop("describe_pdf_figures")
+    fake.overrides[("POST", "/api/v1/jobs")] = httpx.Response(202, json=old_backend)
+    assert upload(client)
+
+
+def test_invalid_pdf_figure_mode_is_rejected_before_upstream(service):
+    client, fake = service
+    response = client.post(
+        "/files", files={"file": ("modes.pdf", CONTENT)},
+        data={"describe_pdf_figures": "invalid"},
+    )
+    assert response.status_code == 422
+    assert fake.calls == []
+
+
+def test_sse_returns_selected_pdf_figure_mode(service):
+    client, fake = service
+    fake.states.extend([
+        job("recognizing", describe_pdf_figures=False),
+        job(describe_pdf_figures=False),
+    ])
+    response = client.post(
+        "/files", files={"file": ("modes.pdf", CONTENT)},
+        data={"describe_pdf_figures": "false"},
+    )
+    file_id = response.json()["id"]
+    stream = events(client.get(f"/files/{file_id}/events"))
+    assert [kind for kind, _ in stream] == ["progress", "done"]
+    assert all(data["describe_pdf_figures"] is False for _, data in stream)
